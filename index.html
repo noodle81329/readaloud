@@ -152,17 +152,14 @@ hr{border:none;border-top:1px solid var(--border)}
 </div>
 
 <script>
-const WPM = 130; // conservative estimate matching Google UK English Male actual speed
 const MAX_CHARS = 250;
+const DEFAULT_WPM = 130;
 
 let chunks = [], chunkWordOffsets = [], chunkWordArrays = [], wordEls = [];
 let isPlaying = false, isPaused = false, stopped = false;
-let totalSec = 0, remSec = 0, startTs = null, tiv = null;
+let totalSec = 0, remSec = 0, timerStartTs = null, tiv = null;
 let currentHlIdx = -1;
-
-// Timer: updated by actual speech progress, not fixed WPM
-let timerStartTs = null;
-let timerTotalSec = 0;
+let totalWords = 0, speechStartTs = null;
 
 const $ = id => document.getElementById(id);
 const fmt = s => Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0');
@@ -202,62 +199,61 @@ function buildOffsets(cks){
 
 function buildWordPositions(chunkText){
   const positions=[];
-  const re=/\S+/g; let m;
+  const re=/\S+/g;let m;
   while((m=re.exec(chunkText))!==null)
-    positions.push({start:m.index, end:m.index+m[0].length});
-  return positions;
+    positions.push(m.index);
+  return positions; // just start positions — simpler and more accurate
 }
 
-function findWordIdx(positions, ci){
-  // find word whose start <= ci < end, or nearest start
+// Find which word charIndex belongs to: last word whose start <= charIndex
+function findWordIdx(startPositions, ci){
   let best=0;
-  for(let i=0;i<positions.length;i++){
-    if(positions[i].start<=ci) best=i;
-    else break;
+  for(let i=0;i<startPositions.length;i++){
+    if(startPositions[i]<=ci) best=i; else break;
   }
   return best;
 }
 
+// Highlight only — no dimming past words
 function hlWord(idx){
   if(idx===currentHlIdx||idx<0||idx>=wordEls.length) return;
-  if(currentHlIdx>=0&&wordEls[currentHlIdx]){
+  if(currentHlIdx>=0&&wordEls[currentHlIdx])
     wordEls[currentHlIdx].classList.remove('active');
-    wordEls[currentHlIdx].classList.add('done');
-  }
   wordEls[idx].classList.add('active');
   wordEls[idx].scrollIntoView({block:'nearest',behavior:'smooth'});
   currentHlIdx=idx;
 }
 
-// Timer driven by real elapsed time from speech start
+// Timer
 function tick(){
   if(!isPlaying||isPaused) return;
-  const elapsed=(Date.now()-timerStartTs)/1000;
-  remSec=Math.max(0, timerTotalSec-elapsed);
+  remSec=Math.max(0, totalSec-(Date.now()-timerStartTs)/1000);
   $('tCd').textContent=fmt(remSec);
-  $('tBar').style.width=(timerTotalSec>0?remSec/timerTotalSec*100:0)+'%';
+  $('tBar').style.width=(totalSec>0?remSec/totalSec*100:0)+'%';
   if(remSec<=0) clearInterval(tiv);
 }
 function startTimer(s){
-  clearInterval(tiv);
-  timerTotalSec=s; remSec=s;
-  timerStartTs=Date.now();
-  $('timer').classList.add('on');
-  $('tEnd').textContent=endTime(s);
-  tick();
-  tiv=setInterval(tick,500);
+  clearInterval(tiv);totalSec=s;remSec=s;timerStartTs=Date.now();
+  $('timer').classList.add('on');$('tEnd').textContent=endTime(s);
+  tick();tiv=setInterval(tick,500);
 }
-function pauseTimer(){
-  // save remaining on pause
-  timerTotalSec=remSec;
-  clearInterval(tiv); tiv=null;
-}
-function resumeTimer(){
-  timerStartTs=Date.now();
-  $('tEnd').textContent=endTime(remSec);
-  tiv=setInterval(tick,500);
-}
+function pauseTimer(){totalSec=remSec;clearInterval(tiv);tiv=null;}
+function resumeTimer(){timerStartTs=Date.now();$('tEnd').textContent=endTime(remSec);tiv=setInterval(tick,500);}
 function stopTimer(){clearInterval(tiv);tiv=null;$('timer').classList.remove('on');}
+
+function recalibrateTimer(wordsSpokenSoFar){
+  if(!speechStartTs||wordsSpokenSoFar<5) return;
+  const elapsed=(Date.now()-speechStartTs)/1000;
+  const realWpm=(wordsSpokenSoFar/elapsed)*60;
+  if(realWpm<50||realWpm>400) return; // sanity check
+  const wordsLeft=totalWords-wordsSpokenSoFar;
+  const rate=parseFloat($('rSpeed').value);
+  const newRem=Math.max(5,(wordsLeft/realWpm)*60);
+  if(Math.abs(newRem-remSec)>8){
+    totalSec=newRem;remSec=newRem;timerStartTs=Date.now();
+    $('tEnd').textContent=endTime(newRem);
+  }
+}
 
 function setIdle(msg){
   isPlaying=false;isPaused=false;stopped=true;currentHlIdx=-1;
@@ -275,15 +271,11 @@ function getVoice(){
   return speechSynthesis.getVoices().find(v=>v.name===n)||null;
 }
 
-// Track actual words spoken for live timer correction
-let totalWords=0;
-let wordsSpoken=0;
-let speechStartTs=null;
-
 function speakChunk(idx){
   if(stopped||idx>=chunks.length){
     if(!stopped){
-      wordEls.forEach(el=>{el.classList.remove('active');el.classList.add('done');});
+      if(currentHlIdx>=0&&wordEls[currentHlIdx])
+        wordEls[currentHlIdx].classList.remove('active');
       setTimeout(()=>setIdle('Done reading.'),300);
     }
     return;
@@ -294,11 +286,11 @@ function speakChunk(idx){
   const v=getVoice();
   const chunkText=chunks[idx];
   const globalOffset=chunkWordOffsets[idx];
-  const wordPositions=chunkWordArrays[idx];
-  const chunkWordCount=wordPositions.length;
+  const startPositions=chunkWordArrays[idx];
+  const chunkWordCount=startPositions.length;
 
   const utt=new SpeechSynthesisUtterance(chunkText);
-  utt.rate=rate; utt.pitch=pitch;
+  utt.rate=rate;utt.pitch=pitch;
   if(v){utt.voice=v;utt.lang=v.lang;}else{utt.lang='en-US';}
 
   let boundaryFired=false;
@@ -309,27 +301,12 @@ function speakChunk(idx){
     if(stopped||e.name!=='word') return;
     boundaryFired=true;
     if(fallbackIv){clearInterval(fallbackIv);fallbackIv=null;}
-
-    const localIdx=findWordIdx(wordPositions, e.charIndex);
+    const localIdx=findWordIdx(startPositions,e.charIndex);
     if(localIdx!==lastLocalIdx){
       lastLocalIdx=localIdx;
-      hlWord(globalOffset+localIdx);
-
-      // Dynamically recalibrate timer based on actual progress
-      wordsSpoken=globalOffset+localIdx;
-      if(speechStartTs&&wordsSpoken>0){
-        const elapsed=(Date.now()-speechStartTs)/1000;
-        const actualWpm=(wordsSpoken/elapsed)*60;
-        const wordsLeft=totalWords-wordsSpoken;
-        const newRemSec=wordsLeft/(actualWpm||WPM)*60;
-        // smooth update — only adjust if significantly different
-        if(Math.abs(newRemSec-remSec)>5){
-          timerTotalSec=newRemSec;
-          timerStartTs=Date.now();
-          remSec=newRemSec;
-          $('tEnd').textContent=endTime(newRemSec);
-        }
-      }
+      const globalIdx=globalOffset+localIdx;
+      hlWord(globalIdx);
+      recalibrateTimer(globalIdx);
     }
   };
 
@@ -337,17 +314,17 @@ function speakChunk(idx){
     if(idx===0) speechStartTs=Date.now();
     hlWord(globalOffset);
     lastLocalIdx=0;
-
+    // fallback if onboundary never fires
     setTimeout(()=>{
       if(!boundaryFired&&!stopped){
         let li=0;
-        const msPerWord=(60/WPM/rate)*1000;
+        const ms=(60/DEFAULT_WPM/rate)*1000;
         fallbackIv=setInterval(()=>{
-          if(stopped||isPaused) return;
+          if(stopped||isPaused)return;
           li++;
           if(li>=chunkWordCount){clearInterval(fallbackIv);fallbackIv=null;return;}
           hlWord(globalOffset+li);
-        },msPerWord);
+        },ms);
       }
     },500);
   };
@@ -359,7 +336,7 @@ function speakChunk(idx){
 
   utt.onerror=e=>{
     if(fallbackIv){clearInterval(fallbackIv);fallbackIv=null;}
-    if(e.error==='interrupted') return;
+    if(e.error==='interrupted')return;
     showErr('TTS error: '+e.error);setIdle('Error.');
   };
 
@@ -391,7 +368,7 @@ function onTextChange(){
   }
   const w=text.split(/\s+/).filter(Boolean).length,c=text.length;
   $('sWords').textContent=w>999?(w/1000).toFixed(1)+'k':w;
-  $('sMin').textContent=Math.ceil(w/WPM);
+  $('sMin').textContent=Math.ceil(w/DEFAULT_WPM);
   $('sChars').textContent=c>999?(c/1000).toFixed(1)+'k':c;
   $('bPlay').disabled=false;hideErr();stat('','Ready · click Play');
 }
@@ -403,7 +380,7 @@ $('bPlay').addEventListener('click',function(){
   const text=$('textArea').value.trim();
   if(!text){showErr('No text.');return;}
   hideErr();speechSynthesis.cancel();
-  stopped=false;currentHlIdx=-1;wordsSpoken=0;speechStartTs=null;
+  stopped=false;currentHlIdx=-1;speechStartTs=null;
   chunks=splitChunks(text);
   buildDisplay(text);
   chunkWordOffsets=buildOffsets(chunks);
@@ -416,7 +393,7 @@ $('bPlay').addEventListener('click',function(){
   $('bPlay').disabled=true;$('bPause').disabled=false;$('bStop').disabled=false;
   stat('playing','Reading aloud…');
   const rate=parseFloat($('rSpeed').value);
-  startTimer(Math.ceil(totalWords/(WPM*rate)*60));
+  startTimer(Math.ceil(totalWords/(DEFAULT_WPM*rate)*60));
   speakChunk(0);
 });
 
