@@ -155,7 +155,12 @@ hr{border:none;border-top:1px solid var(--border)}
 const MAX_CHARS = 250;
 const DEFAULT_WPM = 130;
 
-let chunks = [], chunkWordOffsets = [], chunkWordArrays = [], wordEls = [];
+// wordEls[i] = { el, globalCharStart } — indexed same as words in full text
+let chunks = [], wordEls = [];
+// per-chunk: array of char start positions within that chunk
+let chunkWordStarts = [];
+// global char start of each chunk within the full text
+let chunkGlobalOffset = [];
 let isPlaying = false, isPaused = false, stopped = false;
 let totalSec = 0, remSec = 0, timerStartTs = null, tiv = null;
 let currentHlIdx = -1;
@@ -179,37 +184,55 @@ function splitChunks(text){
   return result;
 }
 
-function buildDisplay(text){
-  const rd=$('readingDisplay');rd.innerHTML='';wordEls=[];
-  text.split(/(\s+)/).forEach(tok=>{
-    if(/^\s+$/.test(tok)) rd.appendChild(document.createTextNode(tok));
-    else if(tok.length){
+// Build display AND index simultaneously so they're always in sync.
+// wordEls[i] = { el, globalCharStart }
+function buildDisplay(text, cks){
+  const rd=$('readingDisplay');rd.innerHTML='';
+  wordEls=[];chunkWordStarts=[];chunkGlobalOffset=[];
+
+  // Find each chunk's actual start position in the full text
+  let searchFrom=0;
+  const chunkStarts=cks.map(c=>{
+    const pos=text.indexOf(c,searchFrom);
+    searchFrom=pos+c.length;
+    return pos;
+  });
+
+  // Tokenise the full text for display; for each word token record its char pos in text
+  const re=/(\s+)|(\S+)/g;let m;
+  let wordCount=0;
+  // chunk boundary index so we know which chunk a word belongs to
+  while((m=re.exec(text))!==null){
+    if(m[1]){
+      rd.appendChild(document.createTextNode(m[1]));
+    } else {
+      const globalPos=m.index;
       const sp=document.createElement('span');
-      sp.className='word';sp.textContent=tok;
-      rd.appendChild(sp);wordEls.push(sp);
+      sp.className='word';sp.textContent=m[2];
+      rd.appendChild(sp);
+      wordEls.push({el:sp,globalCharStart:globalPos});
+      wordCount++;
     }
+  }
+
+  // For each chunk, record its global char offset and per-chunk word char positions
+  cks.forEach((c,ci)=>{
+    const gOff=chunkStarts[ci];
+    chunkGlobalOffset.push(gOff);
+    const positions=[];
+    const wr=/\S+/g;let wm;
+    while((wm=wr.exec(c))!==null) positions.push(wm.index); // relative to chunk start
+    chunkWordStarts.push(positions);
   });
 }
 
-function buildOffsets(cks){
-  const offsets=[];let idx=0;
-  cks.forEach(c=>{offsets.push(idx);idx+=c.split(/\s+/).filter(Boolean).length;});
-  return offsets;
-}
-
-function buildWordPositions(chunkText){
-  const positions=[];
-  const re=/\S+/g;let m;
-  while((m=re.exec(chunkText))!==null)
-    positions.push(m.index);
-  return positions; // just start positions — simpler and more accurate
-}
-
-// Find which word charIndex belongs to: last word whose start <= charIndex
-function findWordIdx(startPositions, ci){
-  let best=0;
-  for(let i=0;i<startPositions.length;i++){
-    if(startPositions[i]<=ci) best=i; else break;
+// Given a global char position, find the closest wordEls index (binary search)
+function findWordElByGlobalChar(globalChar){
+  let lo=0,hi=wordEls.length-1,best=0;
+  while(lo<=hi){
+    const mid=(lo+hi)>>1;
+    if(wordEls[mid].globalCharStart<=globalChar){best=mid;lo=mid+1;}
+    else hi=mid-1;
   }
   return best;
 }
@@ -218,9 +241,9 @@ function findWordIdx(startPositions, ci){
 function hlWord(idx){
   if(idx===currentHlIdx||idx<0||idx>=wordEls.length) return;
   if(currentHlIdx>=0&&wordEls[currentHlIdx])
-    wordEls[currentHlIdx].classList.remove('active');
-  wordEls[idx].classList.add('active');
-  wordEls[idx].scrollIntoView({block:'nearest',behavior:'smooth'});
+    wordEls[currentHlIdx].el.classList.remove('active');
+  wordEls[idx].el.classList.add('active');
+  wordEls[idx].el.scrollIntoView({block:'nearest',behavior:'smooth'});
   currentHlIdx=idx;
 }
 
@@ -275,7 +298,7 @@ function speakChunk(idx){
   if(stopped||idx>=chunks.length){
     if(!stopped){
       if(currentHlIdx>=0&&wordEls[currentHlIdx])
-        wordEls[currentHlIdx].classList.remove('active');
+        wordEls[currentHlIdx].el.classList.remove('active');
       setTimeout(()=>setIdle('Done reading.'),300);
     }
     return;
@@ -285,8 +308,8 @@ function speakChunk(idx){
   const pitch=parseFloat($('selPitch').value);
   const v=getVoice();
   const chunkText=chunks[idx];
-  const globalOffset=chunkWordOffsets[idx];
-  const startPositions=chunkWordArrays[idx];
+  const gOff=chunkGlobalOffset[idx];
+  const startPositions=chunkWordStarts[idx];
   const chunkWordCount=startPositions.length;
 
   const utt=new SpeechSynthesisUtterance(chunkText);
@@ -295,16 +318,17 @@ function speakChunk(idx){
 
   let boundaryFired=false;
   let fallbackIv=null;
-  let lastLocalIdx=-1;
+  let lastGlobalIdx=-1;
 
   utt.onboundary=e=>{
     if(stopped||e.name!=='word') return;
     boundaryFired=true;
     if(fallbackIv){clearInterval(fallbackIv);fallbackIv=null;}
-    const localIdx=findWordIdx(startPositions,e.charIndex);
-    if(localIdx!==lastLocalIdx){
-      lastLocalIdx=localIdx;
-      const globalIdx=globalOffset+localIdx;
+    // e.charIndex is relative to chunkText; convert to global char pos
+    const globalChar=gOff+e.charIndex;
+    const globalIdx=findWordElByGlobalChar(globalChar);
+    if(globalIdx!==lastGlobalIdx){
+      lastGlobalIdx=globalIdx;
       hlWord(globalIdx);
       recalibrateTimer(globalIdx);
     }
@@ -312,8 +336,9 @@ function speakChunk(idx){
 
   utt.onstart=()=>{
     if(idx===0) speechStartTs=Date.now();
-    hlWord(globalOffset);
-    lastLocalIdx=0;
+    const firstGlobal=findWordElByGlobalChar(gOff);
+    hlWord(firstGlobal);
+    lastGlobalIdx=firstGlobal;
     // fallback if onboundary never fires
     setTimeout(()=>{
       if(!boundaryFired&&!stopped){
@@ -323,7 +348,9 @@ function speakChunk(idx){
           if(stopped||isPaused)return;
           li++;
           if(li>=chunkWordCount){clearInterval(fallbackIv);fallbackIv=null;return;}
-          hlWord(globalOffset+li);
+          const localCharPos=startPositions[li];
+          const globalIdx=findWordElByGlobalChar(gOff+localCharPos);
+          hlWord(globalIdx);
         },ms);
       }
     },500);
@@ -382,9 +409,8 @@ $('bPlay').addEventListener('click',function(){
   hideErr();speechSynthesis.cancel();
   stopped=false;currentHlIdx=-1;speechStartTs=null;
   chunks=splitChunks(text);
-  buildDisplay(text);
-  chunkWordOffsets=buildOffsets(chunks);
-  chunkWordArrays=chunks.map(c=>buildWordPositions(c));
+  buildDisplay(text,chunks);
+  chunkWordStarts;chunkGlobalOffset; // populated inside buildDisplay
   totalWords=text.split(/\s+/).filter(Boolean).length;
   $('textArea').style.display='none';
   $('readingDisplay').style.display='block';
